@@ -124,10 +124,56 @@ normal Anki backups and allow the add-on to rebuild incompatible state.
 
 RWKV4Anki requires Anki Desktop 26.05 or newer on Windows, macOS, or Linux. The
 add-on manifest records 26.05 as the currently tested Anki release without
-blocking later versions. RWKV4Anki does not run on AnkiMobile or AnkiDroid.
-Filtered decks generated on a desktop can be synced to another device, but they
-cannot update RWKV predictions between reviews there and are not recommended as
-the normal way to use the add-on.
+blocking later versions. RWKV4Anki itself does not run on AnkiMobile or
+AnkiDroid. To study RWKV's picks on a phone, use **Mobile Due** (below), which
+rewrites due dates on the desktop so the phone's normal Due queue follows RWKV.
+Filtered decks generated on a desktop can also be synced, but they cannot update
+RWKV predictions between reviews there.
+
+## Mobile Due: RWKV scheduling on AnkiMobile and AnkiDroid
+
+Phones cannot run add-ons, but they do honour the `due` field of synced review
+cards. Mobile Due runs on the desktop after each sync and rewrites that one field:
+
+- **Due now:** every review card whose RWKV Immediate prediction, for the end of
+  the current Anki day by default, is below its deck's desired retention. The
+  same selection rules as filtered decks and the Live Session apply.
+- **Everything else:** moved to the first future day on which RWKV predicts the
+  card will fall below desired retention, capped by the deck's maximum interval.
+  If Mobile Due stops running, the phone therefore keeps working like a normal
+  scheduler instead of facing a backlog.
+- **Priority:** due-now cards are spread over a few days of apparent overdueness,
+  lowest predicted recall first, so a phone sorting reviews by due date shows the
+  most-forgotten cards first.
+
+Only `due` changes. Interval, card type, queue, learning steps and FSRS memory
+state are left alone, and learning, relearning, new, suspended, buried and
+filtered-deck cards are never touched. Each apply is one undoable step, every old
+value is written to an append-only log, and **Restore Pre-RWKV Due Dates** puts
+back the original date of every card not reviewed since Mobile Due moved it.
+
+### Using it
+
+1. Desktop: **RWKV → Mobile Due → Preview** shows what would change.
+2. **Apply Now…** rewrites the dates after showing a summary and then syncs.
+3. **Settings…**: choose **Live** to repeat this automatically after every sync,
+   or **Shadow** to only plan and log. You can also narrow the cards with an Anki
+   search, choose the prediction time, and set an optional auto-sync interval.
+4. Phone: sync, then study the deck's Due cards as usual. Sync again afterwards
+   so the desktop sees your answers before its next run.
+
+Live mode only turns on after one manual **Apply Now**. Automatic runs are held
+back, and you get a tooltip, if the due-now count jumps to more than three times
+its recent median or above half of all review cards. Logs live in the add-on's
+`user_files/profiles/<profile>/mobile_due/` folder (**Open Mobile Due Log
+Folder**).
+
+**Limitations:** the phone works from a snapshot. Predictions are not refreshed
+between answers there, and same-day re-entry from the Live Session does not
+happen on the phone. Cards answered on the phone keep the phone scheduler's
+interval until the next desktop run re-plans them. Running FSRS
+**Optimize/Reschedule** in deck options overwrites the RWKV dates until the next
+run.
 
 ## Known issues
 

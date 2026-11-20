@@ -224,6 +224,10 @@ def setup_menu() -> None:
     )
     _rwkv_menu.addAction(_behavior_lab_action)
 
+    from .mobile_due import install_mobile_due_menu
+
+    install_mobile_due_menu(_rwkv_menu)
+
     _mode_section_separator = _rwkv_menu.addSeparator()
     for mode in RETRIEVABILITY_MODES:
         if mode != RETRIEVABILITY_MODES[0]:

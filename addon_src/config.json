@@ -29,5 +29,17 @@
   "experimental_enable_behavior_lab": false,
   "experimental_enable_adaptive_desired_retention": false,
   "experimental_enable_curve_rescheduling": false,
-  "experimental_enable_short_term_rescheduling": false
+  "experimental_enable_short_term_rescheduling": false,
+  "mobile_due_mode": "off",
+  "mobile_due_search": "",
+  "mobile_due_prediction_time": "end_of_day",
+  "mobile_due_run_after_sync": true,
+  "mobile_due_sync_after_apply": true,
+  "mobile_due_auto_sync_hours": 0,
+  "mobile_due_limit": 0,
+  "mobile_due_minimum": 0,
+  "mobile_due_random_card_percent": 0,
+  "mobile_due_priority_buckets": 7,
+  "mobile_due_horizon_days": 365,
+  "mobile_due_guardrails": true
 }
