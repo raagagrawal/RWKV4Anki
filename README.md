@@ -159,10 +159,12 @@ every card not reviewed since Mobile Due moved it.
 card was changed last, so rewriting a card the phone has answered but not yet
 synced would undo that answer. Automatic runs therefore never touch a card that
 is already due; they only pull cards in from the future or move future cards.
-Already-due cards stay due until answered. Automatic runs also only start after
-a sync that actually exchanged data, never after a failed one. **Apply Now** asks
-whether to also move currently-due cards. That is the full replacement, and it is
-safe once the phone has synced.
+Already-due cards stay due until answered. So do cards that an earlier Apply Now
+moved out of due: the phone may still show them as due until it syncs, so they
+are left alone until a newer review of them arrives. Automatic runs also only
+start after a sync that actually exchanged data, never after a failed one.
+**Apply Now** can optionally move currently-due cards as well (the full
+replacement). That is off by default; tick it only after the phone has synced.
 
 ### Using it
 
@@ -177,11 +179,13 @@ safe once the phone has synced.
 Live mode only turns on after one manual **Apply Now** that changed cards.
 Automatic runs are held back, with a tooltip, in any of these cases:
 
-- the due-now count is more than three times its recent median, or less than a
-  fifth of it;
+- the due-now count is more than three times its recent median;
 - more than half of all review cards would be due now;
-- more than half of all review cards never drop below desired retention within
-  the horizon (saturated predictions). Logs live in the add-on's
+- far more cards than usual for this collection never drop below desired
+  retention within the horizon, which suggests saturated predictions.
+
+Held-back runs still count towards the recent levels, so a change that persists
+(a backlog after a break) becomes the new normal after a few syncs. Logs live in the add-on's
 `user_files/profiles/<profile>/mobile_due/` folder (**Open Mobile Due Log
 Folder**).
 

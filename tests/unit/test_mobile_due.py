@@ -331,10 +331,35 @@ def test_lock_currently_due_drops_every_change_to_due_cards():
     assert all(c.old_due > TODAY for c in locked.changes)
 
 
-def test_guardrails_catch_collapse_and_saturation():
+def test_saturation_guardrail_uses_collection_history_and_ignores_max_interval_caps():
     cards = {cid: {"last_day": TODAY - 1, "stability": 10_000.0, "due": TODAY} for cid in range(1, 151)}
     plan, _f, _ = plan_for(cards)
-    assert plan.due_now_count == 0
-    violations = guardrail_violations(plan, recent_due_now_counts=[60, 70, 80])
-    assert any("far below the recent median" in v for v in violations)
-    assert any("never drop below" in v for v in violations)
+    assert plan.due_now_count == 0 and plan.beyond_horizon_count == 150
+    # No history: only an extreme fraction (> 90%) trips it.
+    assert any("never drop below" in v for v in guardrail_violations(plan, recent_due_now_counts=[]))
+    # A mature collection that is usually ~95% beyond the horizon is normal for it.
+    mature = dict(cards)
+    for cid in range(151, 159):
+        mature[cid] = {"last_day": TODAY - 1, "stability": 4.0, "due": TODAY + 1}
+    mature_plan, _f, _ = plan_for(mature)
+    assert 0.9 < mature_plan.beyond_horizon_count / mature_plan.in_scope_count < 0.99
+    assert not any(
+        "never drop below" in v
+        for v in guardrail_violations(mature_plan, recent_due_now_counts=[], recent_beyond_horizon_fractions=[0.93, 0.95, 0.94])
+    )
+    # ...but a jump from its usual 20% is not.
+    assert any(
+        "never drop below" in v
+        for v in guardrail_violations(plan, recent_due_now_counts=[], recent_beyond_horizon_fractions=[0.2, 0.2, 0.25])
+    )
+    # Cards stopped by a short deck max interval are not "beyond the horizon".
+    capped, _f, _ = plan_for(cards, max_interval=30)
+    assert capped.projected_to_horizon == 150 and capped.beyond_horizon_count == 0
+    assert guardrail_violations(capped, recent_due_now_counts=[]) == []
+
+
+def test_finishing_reviews_does_not_trip_guardrails():
+    """Regression: a small due-now count after the user clears the queue is normal."""
+    cards = {cid: {"last_day": TODAY - 1, "stability": 3.0 + cid, "due": TODAY + 2} for cid in range(1, 151)}
+    plan, _f, _ = plan_for(cards)
+    assert guardrail_violations(plan, recent_due_now_counts=[200, 210, 190, 205]) == []

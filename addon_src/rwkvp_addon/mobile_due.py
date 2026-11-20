@@ -121,6 +121,7 @@ class MobileDuePlan:
     expected_retrievability: float | None = None
     capped_by_limit: int = 0
     projected_to_horizon: int = 0
+    beyond_horizon_count: int = 0
     locked_due_count: int = 0
 
     @property
@@ -333,7 +334,7 @@ def build_mobile_due_plan(
     remaining = [
         c for c in candidates if c.card_id not in selected_set and c.card_id not in below_set
     ]
-    projected, at_horizon = _project_crossing_days(
+    projected, at_horizon, beyond_horizon = _project_crossing_days(
         remaining,
         review_data=review_data,
         schedule_by_card=schedule_by_card,
@@ -387,6 +388,7 @@ def build_mobile_due_plan(
         expected_retrievability=expected,
         capped_by_limit=len(capped),
         projected_to_horizon=at_horizon,
+        beyond_horizon_count=beyond_horizon,
     )
 
 
@@ -402,8 +404,12 @@ def _project_crossing_days(
     target_timestamp: float,
     horizon_days: int,
     progress=None,
-) -> tuple[dict[int, int], int]:
+) -> tuple[dict[int, int], int, int]:
     """Find, per card, the first day offset d >= 1 with R(T + d days) < DR.
+
+    Returns ``(due_by_card, capped, beyond_horizon)``: ``capped`` counts cards
+    with no crossing before their cap (horizon or deck max interval);
+    ``beyond_horizon`` only those whose cap was the horizon itself.
 
     Every card is known to be at or above DR at offset 0. Offsets are probed
     exponentially (1, 2, 4, ...) up to each card's cap, then bisected. Each
@@ -411,7 +417,7 @@ def _project_crossing_days(
     """
 
     if not candidates:
-        return {}, 0
+        return {}, 0, 0
     lo: dict[int, int] = {}
     hi: dict[int, int] = {}
     cap: dict[int, int] = {}
@@ -483,11 +489,14 @@ def _project_crossing_days(
 
     result: dict[int, int] = {}
     at_horizon = 0
+    beyond_horizon = 0
     for card_id in lo:
         if card_id in hi:
             result[card_id] = int(today) + max(1, int(hi[card_id]))
             continue
         at_horizon += 1
+        if int(cap[card_id]) >= int(horizon_days):
+            beyond_horizon += 1
         cap_day = int(today) + max(1, int(cap[card_id]))
         # No crossing within the horizon: never pull the card earlier than its
         # current schedule, unless that schedule exceeds the deck's max interval.
@@ -501,7 +510,7 @@ def _project_crossing_days(
         )
         keep = current_due if limit_day is None else min(current_due, limit_day)
         result[card_id] = max(cap_day, keep)
-    return result, at_horizon
+    return result, at_horizon, beyond_horizon
 
 
 def _max_interval_day(
@@ -576,9 +585,9 @@ class GuardrailSettings:
     spike_minimum_cards: int = 50
     max_due_now_fraction: float = 0.5
     max_due_now_fraction_min_scope: int = 100
-    collapse_divisor: float = 5.0
-    collapse_minimum_median: int = 20
-    max_horizon_fraction: float = 0.5
+    beyond_horizon_fraction_without_history: float = 0.9
+    beyond_horizon_fraction_floor: float = 0.5
+    beyond_horizon_fraction_margin: float = 0.2
     history_runs: int = 7
 
 
@@ -586,9 +595,15 @@ def guardrail_violations(
     plan: MobileDuePlan,
     *,
     recent_due_now_counts: Sequence[int],
+    recent_beyond_horizon_fractions: Sequence[float] = (),
     settings: GuardrailSettings | None = None,
 ) -> list[str]:
-    """Return human-readable reasons this plan should not be auto-applied."""
+    """Return human-readable reasons this plan should not be auto-applied.
+
+    Histories should include held-back runs, so a level that persists (a
+    backlog after a break, a mature collection) becomes the new normal after a
+    few syncs instead of blocking every automatic run.
+    """
 
     resolved = settings or GuardrailSettings()
     violations: list[str] = []
@@ -601,20 +616,27 @@ def guardrail_violations(
                 f"{plan.due_now_count} cards due now is more than "
                 f"{resolved.spike_multiplier:g}x the recent median ({baseline})."
             )
-        if (
-            baseline >= int(resolved.collapse_minimum_median)
-            and plan.due_now_count < baseline / float(resolved.collapse_divisor)
-        ):
-            violations.append(
-                f"Only {plan.due_now_count} cards due now, far below the recent median "
-                f"({baseline}); predictions may be broken."
-            )
     if plan.in_scope_count >= int(resolved.max_due_now_fraction_min_scope):
-        horizon_fraction = plan.projected_to_horizon / max(1, plan.in_scope_count)
-        if horizon_fraction > float(resolved.max_horizon_fraction):
+        # Saturated predictions (e.g. a broken checkpoint predicting R ~ 1) push
+        # everything to the horizon. Mature collections legitimately have many
+        # such cards, so compare with this collection's own recent level.
+        fraction = plan.beyond_horizon_count / max(1, plan.in_scope_count)
+        fractions = [float(v) for v in recent_beyond_horizon_fractions][-int(resolved.history_runs):]
+        if len(fractions) >= 3:
+            median = sorted(fractions)[len(fractions) // 2]
+            limit = min(
+                0.99,
+                max(
+                    float(resolved.beyond_horizon_fraction_floor),
+                    median + float(resolved.beyond_horizon_fraction_margin),
+                ),
+            )
+        else:
+            limit = float(resolved.beyond_horizon_fraction_without_history)
+        if fraction > limit:
             violations.append(
-                f"{horizon_fraction:.0%} of review cards never drop below desired "
-                "retention within the horizon; predictions may be saturated."
+                f"{fraction:.0%} of review cards never drop below desired retention "
+                f"within the horizon (limit {limit:.0%}); predictions may be saturated."
             )
     if plan.in_scope_count >= int(resolved.max_due_now_fraction_min_scope):
         fraction = plan.due_now_count / max(1, plan.in_scope_count)
@@ -656,6 +678,20 @@ def plan_summary_lines(plan: MobileDuePlan) -> list[str]:
 
 def plan_with_changes(plan: MobileDuePlan, changes: Iterable[MobileDueChange]) -> MobileDuePlan:
     return replace(plan, changes=tuple(changes))
+
+
+def lock_cards(plan: MobileDuePlan, card_ids: Iterable[int]) -> MobileDuePlan:
+    """Drop changes to the given cards (counted as locked)."""
+
+    locked_ids = {int(card_id) for card_id in card_ids}
+    if not locked_ids:
+        return plan
+    kept = [change for change in plan.changes if change.card_id not in locked_ids]
+    return replace(
+        plan,
+        changes=tuple(kept),
+        locked_due_count=plan.locked_due_count + len(plan.changes) - len(kept),
+    )
 
 
 def lock_currently_due(plan: MobileDuePlan) -> MobileDuePlan:

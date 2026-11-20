@@ -58,6 +58,10 @@ class MobileDueLedger:
     def baseline_path(self) -> Path:
         return self.root / "baseline.jsonl"
 
+    @property
+    def pushed_out_path(self) -> Path:
+        return self.root / "pushed_out.jsonl"
+
     def ensure(self) -> None:
         self.changes_dir.mkdir(parents=True, exist_ok=True)
 
@@ -73,6 +77,7 @@ class MobileDueLedger:
         run_id: str,
         applied: Iterable[MobileDueChange],
         last_review_secs: Mapping[int, int] | None = None,
+        today: int | None = None,
         now: float | None = None,
     ) -> None:
         """Durably log rewritten cards. Call BEFORE writing them to the collection.
@@ -87,6 +92,18 @@ class MobileDueLedger:
         self.ensure()
         timestamp = float(time.time() if now is None else now)
         self._update_baseline(applied_list, last_review_secs or {}, timestamp)
+        if today is not None:
+            # Track push-outs (due -> later). A later change to a tracked card
+            # clears its mark. Only those rows are written, so the file stays small.
+            tracked = self.pushed_out_unreviewed_candidates()
+            rows = []
+            for change in applied_list:
+                pushed = change.old_due <= int(today) < change.new_due
+                if pushed or change.card_id in tracked:
+                    rows.append(
+                        {"card_id": change.card_id, "timestamp": timestamp, "pushed_out": pushed}
+                    )
+            _append_jsonl(self.pushed_out_path, rows)
         day = time.strftime("%Y-%m-%d", time.localtime(timestamp))
         _append_jsonl(
             self.changes_dir / f"{day}.jsonl",
@@ -152,6 +169,12 @@ class MobileDueLedger:
                     "locked_due": plan.locked_due_count,
                     "capped_by_limit": plan.capped_by_limit,
                     "projected_to_horizon": plan.projected_to_horizon,
+                    "beyond_horizon": plan.beyond_horizon_count,
+                    "beyond_horizon_fraction": (
+                        plan.beyond_horizon_count / plan.in_scope_count
+                        if plan.in_scope_count
+                        else 0.0
+                    ),
                     "expected_retrievability": plan.expected_retrievability,
                     "skipped": {reason.value: count for reason, count in plan.skipped.items()},
                 }
@@ -209,13 +232,34 @@ class MobileDueLedger:
     def runs(self) -> list[dict[str, Any]]:
         return list(_read_jsonl(self.runs_path))
 
-    def recent_due_now_counts(self, limit: int = 7) -> list[int]:
-        counts = [
-            int(run["due_now"])
+    def recent_values(self, key: str, limit: int = 7) -> list[float]:
+        """Recent planned values, held-back runs included (see guardrails)."""
+        values = [
+            float(run[key])
             for run in self.runs()
-            if run.get("kind") in {RUN_KIND_LIVE, RUN_KIND_SHADOW} and "due_now" in run
+            if run.get("kind") in {RUN_KIND_LIVE, RUN_KIND_SHADOW, RUN_KIND_ABORTED}
+            and run.get(key) is not None
         ]
-        return counts[-int(limit):]
+        return values[-int(limit):]
+
+    def recent_due_now_counts(self, limit: int = 7) -> list[int]:
+        return [int(value) for value in self.recent_values("due_now", limit)]
+
+    def pushed_out_unreviewed_candidates(self) -> dict[int, float]:
+        """Cards whose latest change moved them from due to a later day.
+
+        Maps card id -> time of that change. The phone may still show such a
+        card as due (and answer it) until it syncs, so automatic runs must not
+        rewrite it again before a newer review has been seen.
+        """
+
+        latest: dict[int, tuple[float, bool]] = {}
+        for row in _read_jsonl(self.pushed_out_path):
+            try:
+                latest[int(row["card_id"])] = (float(row["timestamp"]), bool(row["pushed_out"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return {card_id: ts for card_id, (ts, pushed) in latest.items() if pushed}
 
     def has_live_run(self) -> bool:
         """True once a live run has actually rewritten at least one card."""

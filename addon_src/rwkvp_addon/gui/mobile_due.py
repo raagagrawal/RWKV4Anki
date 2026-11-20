@@ -28,6 +28,7 @@ from ..mobile_due import (
     MobileDuePlan,
     build_mobile_due_plan,
     guardrail_violations,
+    lock_cards,
     lock_currently_due,
     plan_summary_lines,
     resolve_target_timestamp,
@@ -36,6 +37,7 @@ from ..mobile_due_collection import (
     ApplyResult,
     PlanOutdatedError,
     apply_mobile_due_changes,
+    cards_not_reviewed_since,
     collect_mobile_due_inputs,
     restore_baseline_due_dates,
 )
@@ -204,14 +206,16 @@ def _set_mode(mode: MobileDueMode) -> None:
 
 
 def _on_profile_did_open() -> None:
-    global _closing
+    global _closing, _running
     _closing = False
+    _running = False  # a dialog torn down with the old profile never reported back
     _reschedule_timer()
 
 
 def _on_profile_will_close() -> None:
-    global _closing, _timer
+    global _closing, _timer, _running
     _closing = True
+    _running = False
     if _timer is not None:
         _timer.stop()
 
@@ -454,6 +458,9 @@ def _decide_inner(
         guardrail_violations(
             plan,
             recent_due_now_counts=ledger.recent_due_now_counts(config.guardrails.history_runs),
+            recent_beyond_horizon_fractions=ledger.recent_values(
+                "beyond_horizon_fraction", config.guardrails.history_runs
+            ),
             settings=config.guardrails,
         )
         if config.guardrails_enabled
@@ -484,8 +491,8 @@ def _decide_inner(
             show_quiet_info(f"{header}\n\n{summary}\n\nNothing to change.", title=TITLE, parent=mw)
             _finish_run()
             return
-        first_run = not ledger.has_live_run()
-        choice = {"move_due": first_run}
+        # Off by default: moving due cards is only safe once the phone has synced.
+        choice = {"move_due": False}
         summary = "\n".join(plan_summary_lines(plan))
         warning = (
             "\n\nGuardrail warnings (you can still apply):\n- " + "\n- ".join(violations)
@@ -506,7 +513,7 @@ def _decide_inner(
             confirm_label="Apply Due Dates",
             destructive=True,
             checkbox_label="Also move cards that are due now but RWKV says can wait",
-            checkbox_checked=first_run,
+            checkbox_checked=False,
             on_checkbox_changed=lambda checked: choice.update(move_due=bool(checked)),
             on_result=lambda ok: (
                 _apply(
@@ -521,8 +528,11 @@ def _decide_inner(
         )
         return
 
-    # Automatic run after a sync: never touch cards that are already due.
-    plan = locked
+    # Automatic run after a sync: never touch cards that are already due, nor
+    # cards an earlier Apply Now moved out of due that the phone may still show
+    # as due (until a newer review of them has synced in).
+    pending = ledger.pushed_out_unreviewed_candidates()
+    plan = lock_cards(locked, cards_not_reviewed_since(mw.col, pending) if pending else ())
     if config.mode == MobileDueMode.SHADOW:
         _safe_record(kind=RUN_KIND_SHADOW, plan=plan, trigger=trigger, violations=violations)
         tooltip(
@@ -580,7 +590,11 @@ def _apply(
     def before_write(applied, last_review_secs) -> None:
         # Durable restore data first; an exception here aborts with nothing written.
         ledger.record_changes(
-            run_id=run_id, applied=applied, last_review_secs=last_review_secs, now=started
+            run_id=run_id,
+            applied=applied,
+            last_review_secs=last_review_secs,
+            today=plan.today,
+            now=started,
         )
 
     def op(col):

@@ -252,11 +252,11 @@ def test_interactive_apply_lets_user_choose_to_move_due_cards(gui, monkeypatch):
     changes = [MobileDueChange(1, 105, 100, 0, 10, True, 0.8, 0.9, 0), MobileDueChange(2, 99, 120, 0, 10, False, 0.95, 0.9, None)]
     _decide(gui, plan(changes=changes), trigger="menu_apply", interactive=True)
     prompt = prompts[-1]
-    assert prompt["checkbox_checked"] is True  # first run: full replacement offered by default
-    prompt["on_checkbox_changed"](False)
+    assert prompt["checkbox_checked"] is False  # moving due cards is opt-in
     prompt["on_result"](True)
     assert [c.card_id for c in applied[-1].changes] == [1]
     _decide(gui, plan(changes=changes), trigger="menu_apply", interactive=True)
+    prompts[-1]["on_checkbox_changed"](True)
     prompts[-1]["on_result"](True)
     assert [c.card_id for c in applied[-1].changes] == [1, 2]
     _decide(gui, plan(changes=changes), trigger="menu_apply", interactive=True)
@@ -288,3 +288,48 @@ def test_timer_does_not_sync_while_reviewing(gui):
     gui.mw.state = "deckBrowser"
     gui.module._on_timer()
     assert len(gui.mw.synced) == 1
+
+
+def test_auto_run_keeps_hands_off_cards_pushed_out_until_reviewed(gui, monkeypatch):
+    """Regression: Apply Now pushed W out; the phone (not yet synced) may still answer W."""
+    import time as _time
+
+    from rwkvp_addon.mobile_due import MobileDueChange
+
+    col = gui.mw.col
+    model = col.models.by_name("Basic")
+    note = col.new_note(model)
+    note["Front"] = "w"
+    col.add_note(note, 1)
+    w = note.card_ids()[0]
+    applied = []
+    monkeypatch.setattr(gui.module, "_apply", lambda p, **k: applied.append(p))
+    _set_mode(gui, "live")
+    gui.ledger.record_run(kind="live", plan=plan(), trigger="menu_apply", applied_count=1)
+    pushed_at = _time.time() - 600
+    gui.ledger.record_changes(
+        run_id="manual",
+        applied=[MobileDueChange(w, 100, 107, 0, 10, False, 0.95, 0.9, None)],
+        today=100,
+        now=pushed_at,
+    )
+    reproject = MobileDueChange(w, 107, 106, 0, 10, False, 0.94, 0.9, None)
+    _decide(gui, plan(changes=[reproject]))
+    assert applied == [] or applied[-1].changes == ()
+    # Once a newer review of W has synced in, W is free to be planned again.
+    col.db.execute(
+        "insert into revlog (id,cid,usn,ease,ivl,lastIvl,factor,time,type) values (?,?,?,?,?,?,?,?,?)",
+        int(_time.time() * 1000), w, -1, 3, 6, 10, 0, 3000, 1,
+    )
+    _decide(gui, plan(changes=[reproject]))
+    assert [c.card_id for c in applied[-1].changes] == [w]
+
+
+def test_profile_hooks_clear_a_stuck_run_flag(gui, monkeypatch):
+    monkeypatch.setattr(gui.module, "_reschedule_timer", lambda: None)
+    gui.module._running = True
+    gui.module._on_profile_will_close()
+    assert gui.module._running is False
+    gui.module._running = True
+    gui.module._on_profile_did_open()
+    assert gui.module._running is False

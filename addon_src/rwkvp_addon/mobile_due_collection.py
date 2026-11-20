@@ -189,12 +189,16 @@ def _latest_graded_review_secs_by_card(col, card_ids: Iterable[int]) -> dict[int
     ids = sorted({int(card_id) for card_id in card_ids})
     if not ids:
         return {}
-    rows = col.db.all(
-        "SELECT cid, MAX(id) FROM revlog "
-        f"WHERE cid IN ({','.join(map(str, ids))}) AND ease BETWEEN 1 AND 4 "
-        "GROUP BY cid"
-    )
-    return {int(cid): int(review_id) // 1000 for cid, review_id in rows if review_id}
+    latest: dict[int, int] = {}
+    for start in range(0, len(ids), APPLY_CHUNK_SIZE):
+        chunk = ids[start : start + APPLY_CHUNK_SIZE]
+        rows = col.db.all(
+            "SELECT cid, MAX(id) FROM revlog "
+            f"WHERE cid IN ({','.join(map(str, chunk))}) AND ease BETWEEN 1 AND 4 "
+            "GROUP BY cid"
+        )
+        latest.update({int(cid): int(review_id) // 1000 for cid, review_id in rows if review_id})
+    return latest
 
 
 def _still_as_planned(card, change: MobileDueChange) -> bool:
@@ -276,3 +280,16 @@ def _existing_card_ids(col, card_ids: Iterable[int]) -> list[int]:
             for row in col.db.all(f"SELECT id FROM cards WHERE id IN ({','.join(map(str, chunk))})")
         )
     return found
+
+
+def cards_not_reviewed_since(col, changed_at: Mapping[int, float]) -> set[int]:
+    """Cards with no graded review after the given (seconds) timestamp."""
+
+    if not changed_at:
+        return set()
+    latest_secs = _latest_graded_review_secs_by_card(col, changed_at.keys())
+    return {
+        int(card_id)
+        for card_id, timestamp in changed_at.items()
+        if latest_secs.get(int(card_id), 0) <= float(timestamp)
+    }
