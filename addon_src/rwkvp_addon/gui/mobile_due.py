@@ -28,13 +28,15 @@ from ..mobile_due import (
     MobileDuePlan,
     build_mobile_due_plan,
     guardrail_violations,
+    lock_currently_due,
     plan_summary_lines,
     resolve_target_timestamp,
 )
 from ..mobile_due_collection import (
     ApplyResult,
-    collect_mobile_due_inputs,
+    PlanOutdatedError,
     apply_mobile_due_changes,
+    collect_mobile_due_inputs,
     restore_baseline_due_dates,
 )
 from ..mobile_due_config import MobileDueConfig, MobileDueMode, mobile_due_config, with_mode
@@ -66,6 +68,7 @@ _running = False
 _closing = False
 _skip_next_sync_hook = False
 _hooks_installed = False
+_last_sync_stamp_before: int | None = None
 
 
 class NothingToPlan(Exception):
@@ -129,6 +132,7 @@ def install_mobile_due_menu(parent_menu: QMenu) -> None:
     qconnect(_menu.aboutToShow, _refresh_mode_actions)
 
     if not _hooks_installed:
+        gui_hooks.sync_will_start.append(_on_sync_will_start)
         gui_hooks.sync_did_finish.append(_on_sync_did_finish)
         gui_hooks.profile_did_open.append(_on_profile_did_open)
         gui_hooks.profile_will_close.append(_on_profile_will_close)
@@ -147,8 +151,18 @@ def _ledger() -> MobileDueLedger:
     return MobileDueLedger.for_store_root(store_for_mw(mw).root)
 
 
+def _busy() -> bool:
+    if _running:
+        tooltip(f"{TITLE} is running; try again in a moment.", parent=mw)
+        return True
+    return False
+
+
 def _show_settings() -> None:
     from .mobile_due_settings import MobileDueSettingsDialog
+
+    if _busy():
+        return
 
     def saved() -> None:
         _refresh_mode_actions()
@@ -164,6 +178,10 @@ def _refresh_mode_actions() -> None:
 
 
 def _set_mode(mode: MobileDueMode) -> None:
+    if _busy():
+        _refresh_mode_actions()
+        return
+
     def write() -> None:
         write_addon_config_for_mw(mw, with_mode(addon_config_for_mw(mw), mode))
         _refresh_mode_actions()
@@ -198,12 +216,32 @@ def _on_profile_will_close() -> None:
         _timer.stop()
 
 
+def _last_sync_stamp() -> int | None:
+    try:
+        return int(mw.col.db.scalar("select ls from col") or 0)
+    except Exception:
+        return None
+
+
+def _on_sync_will_start() -> None:
+    global _last_sync_stamp_before
+    _last_sync_stamp_before = _last_sync_stamp() if mw.col is not None else None
+
+
 def _on_sync_did_finish() -> None:
-    global _skip_next_sync_hook
+    global _skip_next_sync_hook, _last_sync_stamp_before
+    before, _last_sync_stamp_before = _last_sync_stamp_before, None
     if _skip_next_sync_hook:
         _skip_next_sync_hook = False
         return
     if _closing or mw.col is None:
+        return
+    # sync_did_finish also fires after a failed or cancelled sync. The
+    # collection's last-sync stamp only advances when a sync actually exchanged
+    # changes, so an unchanged stamp means there is nothing new to plan from
+    # and, after a failure, planning would use stale data.
+    after = _last_sync_stamp()
+    if before is None or after is None or after <= before:
         return
     config = _config()
     if not config.enabled or not config.run_after_sync:
@@ -220,7 +258,7 @@ def _reschedule_timer() -> None:
         qconnect(_timer.timeout, _on_timer)
     _timer.stop()
     if hours > 0:
-        _timer.start(int(hours * 3600 * 1000))
+        _timer.start(int(max(0.25, hours) * 3600 * 1000))
 
 
 def _on_timer() -> None:
@@ -327,7 +365,7 @@ def _start_run(trigger: str, *, interactive: bool) -> None:
         _running = False
 
     def success(plan: MobileDuePlan) -> None:
-        done()
+        # _decide keeps the run marked busy until any apply has finished.
         _decide(plan, trigger=trigger, interactive=interactive, config=config)
 
     def failure(exc: Exception) -> None:
@@ -374,7 +412,43 @@ def _start_run(trigger: str, *, interactive: bool) -> None:
         )
 
 
-def _decide(plan: MobileDuePlan, *, trigger: str, interactive: bool, config: MobileDueConfig) -> None:
+def _finish_run() -> None:
+    global _running
+    _running = False
+
+
+def _decide(
+    plan: MobileDuePlan,
+    *,
+    trigger: str,
+    interactive: bool,
+    config: MobileDueConfig,
+) -> None:
+    """Act on a finished plan. Owns ``_running`` until the run fully ends."""
+
+    try:
+        _decide_inner(plan, trigger=trigger, interactive=interactive, started_with=config)
+    except Exception:
+        _finish_run()
+        raise
+
+
+def _decide_inner(
+    plan: MobileDuePlan,
+    *,
+    trigger: str,
+    interactive: bool,
+    started_with: MobileDueConfig,
+) -> None:
+    # Settings may have changed while RWKV was planning (mode switched off,
+    # restore run): always act on the current configuration.
+    config = _config()
+    if _closing or mw.col is None:
+        _finish_run()
+        return
+    if not interactive and config.mode != started_with.mode:
+        _finish_run()
+        return
     ledger = _ledger()
     violations = (
         guardrail_violations(
@@ -385,21 +459,34 @@ def _decide(plan: MobileDuePlan, *, trigger: str, interactive: bool, config: Mob
         if config.guardrails_enabled
         else []
     )
-    summary = "\n".join(plan_summary_lines(plan))
+    locked = lock_currently_due(plan)
     target = time.strftime("%a %H:%M", time.localtime(plan.target_timestamp))
     header = f"Predicted for {target}."
 
     if trigger == TRIGGER_MENU_PREVIEW:
         _safe_record(kind=RUN_KIND_SHADOW, plan=plan, trigger=trigger, violations=violations)
+        summary = "\n".join(plan_summary_lines(plan))
         warning = ("\n\nGuardrail warnings:\n- " + "\n- ".join(violations)) if violations else ""
-        show_quiet_info(f"{header}\n\n{summary}{warning}", title=TITLE, parent=mw)
+        auto_note = (
+            f"\n\nAutomatic runs leave the {locked.locked_due_count} cards that are already "
+            "due untouched, in case the phone has answered them but not synced yet."
+            if locked.locked_due_count
+            else ""
+        )
+        show_quiet_info(f"{header}\n\n{summary}{warning}{auto_note}", title=TITLE, parent=mw)
+        _finish_run()
         return
 
     if interactive:
         if not plan.changes:
             _safe_record(kind=RUN_KIND_LIVE, plan=plan, trigger=trigger)
+            summary = "\n".join(plan_summary_lines(plan))
             show_quiet_info(f"{header}\n\n{summary}\n\nNothing to change.", title=TITLE, parent=mw)
+            _finish_run()
             return
+        first_run = not ledger.has_live_run()
+        choice = {"move_due": first_run}
+        summary = "\n".join(plan_summary_lines(plan))
         warning = (
             "\n\nGuardrail warnings (you can still apply):\n- " + "\n- ".join(violations)
             if violations
@@ -410,16 +497,32 @@ def _decide(plan: MobileDuePlan, *, trigger: str, interactive: bool, config: Mob
             title=TITLE,
             message=(
                 f"{header}\n\n{summary}{warning}\n\n"
-                "Rewrite these due dates? Only the due field of review cards changes; "
-                "this is one undoable step and every old value is logged."
+                "Rewrite these due dates? Only the due date of review cards changes. "
+                "This is one undoable step, and every old value is logged for Restore.\n\n"
+                f"{locked.locked_due_count} of these cards are due now. Moving them is "
+                "only safe if your phone has synced: Anki keeps the most recently changed "
+                "copy of a card, so an unsynced phone answer to a moved card is lost."
             ),
             confirm_label="Apply Due Dates",
             destructive=True,
-            on_result=lambda ok: _apply(plan, trigger=trigger, config=config) if ok else None,
+            checkbox_label="Also move cards that are due now but RWKV says can wait",
+            checkbox_checked=first_run,
+            on_checkbox_changed=lambda checked: choice.update(move_due=bool(checked)),
+            on_result=lambda ok: (
+                _apply(
+                    plan if choice["move_due"] else locked,
+                    trigger=trigger,
+                    config=config,
+                    interactive=True,
+                )
+                if ok
+                else _finish_run()
+            ),
         )
         return
 
-    # Automatic run after a sync.
+    # Automatic run after a sync: never touch cards that are already due.
+    plan = locked
     if config.mode == MobileDueMode.SHADOW:
         _safe_record(kind=RUN_KIND_SHADOW, plan=plan, trigger=trigger, violations=violations)
         tooltip(
@@ -427,8 +530,10 @@ def _decide(plan: MobileDuePlan, *, trigger: str, interactive: bool, config: Mob
             f"{plan.changed_count} dates would change.",
             parent=mw,
         )
+        _finish_run()
         return
     if config.mode != MobileDueMode.LIVE:
+        _finish_run()
         return
     if not ledger.has_live_run():
         _safe_record(
@@ -437,6 +542,7 @@ def _decide(plan: MobileDuePlan, *, trigger: str, interactive: bool, config: Mob
             trigger=trigger,
             note="first live run must be applied manually",
         )
+        _finish_run()
         return
     if violations:
         _safe_record(kind=RUN_KIND_ABORTED, plan=plan, trigger=trigger, violations=violations)
@@ -445,40 +551,86 @@ def _decide(plan: MobileDuePlan, *, trigger: str, interactive: bool, config: Mob
             parent=mw,
             period=10000,
         )
+        _finish_run()
         return
     if not plan.changes:
         _safe_record(kind=RUN_KIND_LIVE, plan=plan, trigger=trigger)
+        _finish_run()
         return
-    _apply(plan, trigger=trigger, config=config)
+    _apply(plan, trigger=trigger, config=config, interactive=False)
 
 
-def _apply(plan: MobileDuePlan, *, trigger: str, config: MobileDueConfig) -> None:
+def _apply(
+    plan: MobileDuePlan,
+    *,
+    trigger: str,
+    config: MobileDueConfig,
+    interactive: bool,
+) -> None:
     from aqt.operations import CollectionOp
 
+    if not plan.changes:
+        _safe_record(kind=RUN_KIND_LIVE, plan=plan, trigger=trigger)
+        _finish_run()
+        return
+    ledger = _ledger()
+    run_id = ledger.new_run_id()
+    started = time.time()
+
+    def before_write(applied, last_review_secs) -> None:
+        # Durable restore data first; an exception here aborts with nothing written.
+        ledger.record_changes(
+            run_id=run_id, applied=applied, last_review_secs=last_review_secs, now=started
+        )
+
+    def op(col):
+        return apply_mobile_due_changes(
+            col, list(plan.changes), plan_today=plan.today, before_write=before_write
+        )
+
     def success(result: ApplyResult) -> None:
-        _safe_record(
-            kind=RUN_KIND_LIVE,
-            plan=plan,
-            trigger=trigger,
-            applied=result.applied,
-            conflicts=len(result.conflicts),
-        )
-        skipped = f", {len(result.conflicts)} changed meanwhile and skipped" if result.conflicts else ""
-        tooltip(
-            f"{TITLE}: {plan.due_now_count} due now; {len(result.applied)} due dates updated{skipped}.",
-            parent=mw,
-            period=6000,
-        )
-        if config.sync_after_apply:
-            mw.progress.single_shot(300, _push_sync, False)
+        try:
+            _safe_record(
+                kind=RUN_KIND_LIVE,
+                plan=plan,
+                trigger=trigger,
+                run_id=run_id,
+                applied_count=len(result.applied),
+                conflicts=len(result.conflicts),
+            )
+            skipped = (
+                f", {len(result.conflicts)} changed meanwhile and skipped"
+                if result.conflicts
+                else ""
+            )
+            tooltip(
+                f"{TITLE}: {plan.due_now_count} due now; "
+                f"{len(result.applied)} due dates updated{skipped}.",
+                parent=mw,
+                period=6000,
+            )
+            if result.applied and config.sync_after_apply:
+                mw.progress.single_shot(300, _push_sync, False)
+        finally:
+            _finish_run()
 
     def failure(exc: Exception) -> None:
-        _safe_record(kind=RUN_KIND_ABORTED, plan=plan, trigger=trigger, note=f"apply error: {exc}")
-        show_web_warning(str(exc), title=TITLE, parent=mw)
+        try:
+            _safe_record(
+                kind=RUN_KIND_ABORTED,
+                plan=plan,
+                trigger=trigger,
+                run_id=run_id,
+                note=f"apply error: {exc}",
+            )
+            if interactive:
+                show_web_warning(str(exc), title=TITLE, parent=mw)
+            else:
+                tooltip(f"{TITLE} skipped: {exc}", parent=mw, period=6000)
+        finally:
+            _finish_run()
 
-    CollectionOp(mw, lambda col: apply_mobile_due_changes(col, list(plan.changes))).success(
-        success
-    ).failure(failure).run_in_background()
+    CollectionOp(mw, op).success(success).failure(failure).run_in_background()
 
 
 def _safe_record(**kwargs) -> None:
@@ -492,7 +644,7 @@ def _safe_record(**kwargs) -> None:
 
 
 def _confirm_restore() -> None:
-    if mw.col is None:
+    if mw.col is None or _busy():
         return
     baseline = _ledger().baseline()
     if not baseline:
@@ -514,12 +666,17 @@ def _confirm_restore() -> None:
 
 
 def _restore(baseline) -> None:
+    global _running
     from aqt.operations import CollectionOp
 
+    if _busy():
+        return
+    _running = True
     write_addon_config_for_mw(mw, with_mode(addon_config_for_mw(mw), MobileDueMode.OFF))
     _reschedule_timer()
 
     def success(result) -> None:
+        _finish_run()
         ledger = _ledger()
         _safe_record(
             kind=RUN_KIND_RESTORE,
@@ -548,8 +705,12 @@ def _restore(baseline) -> None:
             return _RestoreWithChanges(result, OpChanges())
         return _RestoreWithChanges(result, result.changes)
 
+    def failure(exc: Exception) -> None:
+        _finish_run()
+        show_web_warning(str(exc), title=TITLE, parent=mw)
+
     CollectionOp(mw, op).success(lambda wrapped: success(wrapped.result)).failure(
-        lambda exc: show_web_warning(str(exc), title=TITLE, parent=mw)
+        failure
     ).run_in_background()
 
 

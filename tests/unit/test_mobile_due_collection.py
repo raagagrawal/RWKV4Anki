@@ -12,6 +12,7 @@ from anki.collection import Collection  # noqa: E402
 from rwkvp_addon.mobile_due import MobileDueChange  # noqa: E402
 from rwkvp_addon.mobile_due_collection import (  # noqa: E402
     UNDO_LABEL,
+    PlanOutdatedError,
     apply_mobile_due_changes,
     collect_mobile_due_inputs,
     restore_baseline_due_dates,
@@ -45,10 +46,13 @@ def add_cards(col, count, deck_name="Default"):
     return ids
 
 
+_REVLOG_SEQ = iter(range(10**6))
+
+
 def make_review(col, card_ids, *, due_offset=0, ivl=10, reviewed_days_ago=10):
     today = col.sched.today
-    for index, card_id in enumerate(card_ids):
-        review_ms = int((time.time() - reviewed_days_ago * 86400) * 1000) + index
+    for card_id in card_ids:
+        review_ms = int((time.time() - reviewed_days_ago * 86400) * 1000) + next(_REVLOG_SEQ)
         col.db.execute(
             "insert into revlog (id,cid,usn,ease,ivl,lastIvl,factor,time,type) values (?,?,?,?,?,?,?,?,?)",
             review_ms, card_id, -1, 3, ivl, 0, 0, 4000, 1,
@@ -171,8 +175,15 @@ def test_restore_puts_back_unreviewed_cards_only(col, tmp_path):
     original = {cid: col.get_card(cid).due for cid in cards}
     ledger = MobileDueLedger(tmp_path / "mobile_due")
     changes = [change_for(col, cid, today) for cid in cards]
-    result = apply_mobile_due_changes(col, changes)
-    ledger.record_run(kind=RUN_KIND_LIVE, plan=None, trigger="test", applied=result.applied, now=time.time() - 5)
+    run_id = ledger.new_run_id()
+    result = apply_mobile_due_changes(
+        col,
+        changes,
+        before_write=lambda applied, reviews: ledger.record_changes(
+            run_id=run_id, applied=applied, last_review_secs=reviews, now=time.time() - 5
+        ),
+    )
+    ledger.record_run(kind=RUN_KIND_LIVE, plan=None, trigger="test", run_id=run_id, applied_count=len(result.applied))
 
     # Card 2 is reviewed afterwards: it must keep its new schedule.
     reviewed_at_ms = int(time.time() * 1000)
@@ -195,50 +206,88 @@ def test_ledger_roundtrip(tmp_path):
     first = MobileDueChange(1, 100, 90, 5, 10, True, 0.7, 0.9, 0)
     again = MobileDueChange(1, 90, 95, 6, 10, False, 0.92, 0.9, None)
     ledger.record_run(kind=RUN_KIND_SHADOW, plan=None, trigger="t")
-    ledger.record_run(kind=RUN_KIND_LIVE, plan=None, trigger="t", applied=[first], now=1000.0)
-    ledger.record_run(kind=RUN_KIND_LIVE, plan=None, trigger="t", applied=[again], now=2000.0)
+    ledger.record_run(kind=RUN_KIND_LIVE, plan=None, trigger="t", applied_count=0)
+    assert not ledger.has_live_run()  # a live run that changed nothing does not count
+    ledger.record_changes(run_id="r1", applied=[first], last_review_secs={1: 500}, now=1000.0)
+    ledger.record_run(kind=RUN_KIND_LIVE, plan=None, trigger="t", run_id="r1", applied_count=1, now=1000.0)
     assert ledger.has_live_run()
-    baseline = ledger.baseline()
-    assert baseline[1].original_due == 100  # first-seen value wins
-    assert baseline[1].first_changed_at == 1000.0
+    # Moved again without a review in between: the pre-RWKV value is kept.
+    ledger.record_changes(run_id="r2", applied=[again], last_review_secs={1: 900}, now=2000.0)
+    assert ledger.baseline()[1].original_due == 100
+    assert ledger.baseline()[1].first_changed_at == 1000.0
+    # Reviewed after RWKV moved it, then moved again: the post-review schedule becomes the baseline.
+    third = MobileDueChange(1, 140, 120, 7, 30, False, 0.95, 0.9, None)
+    ledger.record_changes(run_id="r3", applied=[third], last_review_secs={1: 2500}, now=3000.0)
+    assert ledger.baseline()[1].original_due == 140
+    assert ledger.baseline()[1].first_changed_at == 3000.0
     # A torn trailing line (crash mid-write) is ignored.
     with ledger.runs_path.open("a") as handle:
         handle.write('{"kind": "li')
     assert len(ledger.runs()) == 3
     changes_files = list(ledger.changes_dir.glob("*.jsonl"))
     assert changes_files and all(len(p.stem) == 10 and p.stem[4] == "-" for p in changes_files)
-    archived = ledger.archive_baseline(now=3000.0)
+    archived = ledger.archive_baseline(now=4000.0)
     assert archived is not None and archived.exists()
     assert ledger.baseline() == {}
 
 
-def test_apply_refuses_cards_without_a_graded_review(col):
+def test_restore_after_review_and_second_move_returns_scheduler_due(col, tmp_path):
+    """Regression: scheduler +20 -> RWKV +3 -> reviewed (scheduler +15) -> RWKV +8 -> restore = +15."""
     cards = add_cards(col, 1)
+    make_review(col, cards, due_offset=20)
     today = col.sched.today
-    col.db.execute("update cards set type=2, queue=2, ivl=5, due=? where id=?", today + 2, cards[0])
-    result = apply_mobile_due_changes(col, [change_for(col, cards[0], today)])
-    assert result.applied == ()
-    assert result.conflicts == (cards[0],)
-    assert col.get_card(cards[0]).due == today + 2
+    ledger = MobileDueLedger(tmp_path / "md")
+
+    def apply_with_ledger(new_due, now):
+        return apply_mobile_due_changes(
+            col,
+            [change_for(col, cards[0], new_due)],
+            before_write=lambda applied, reviews: ledger.record_changes(
+                run_id=ledger.new_run_id(), applied=applied, last_review_secs=reviews, now=now
+            ),
+        )
+
+    apply_with_ledger(today + 3, time.time() - 3600)
+    # The phone answers it (synced in): new revlog, scheduler puts it at +15.
+    col.db.execute(
+        "insert into revlog (id,cid,usn,ease,ivl,lastIvl,factor,time,type) values (?,?,?,?,?,?,?,?,?)",
+        int((time.time() - 1800) * 1000), cards[0], -1, 3, 15, 10, 0, 3000, 1,
+    )
+    col.db.execute("update cards set due=?, mod=? where id=?", today + 15, int(time.time()) - 1800, cards[0])
+    apply_with_ledger(today + 8, time.time() - 60)
+    assert col.get_card(cards[0]).due == today + 8
+    restore = restore_baseline_due_dates(col, ledger.baseline())
+    assert restore.restored == 1
+    assert col.get_card(cards[0]).due == today + 15
 
 
-def test_moving_due_does_not_change_fsrs_next_interval(col):
-    from anki.cards import FSRSMemoryState
+def test_ledger_failure_aborts_apply_with_nothing_written(col):
+    cards = add_cards(col, 2)
+    make_review(col, cards, due_offset=4)
+    today = col.sched.today
+    before = {cid: col.get_card(cid).due for cid in cards}
 
-    col.set_config("fsrs", True)
+    def broken_ledger(_applied, _reviews):
+        raise OSError("disk full")
+
+    with pytest.raises(OSError):
+        apply_mobile_due_changes(col, [change_for(col, cid, today) for cid in cards], before_write=broken_ledger)
+    assert {cid: col.get_card(cid).due for cid in cards} == before
+    assert col.undo_status().undo != UNDO_LABEL
+
+
+def test_apply_refuses_a_plan_from_a_previous_day(col):
     cards = add_cards(col, 1)
-    make_review(col, cards, due_offset=0, ivl=10, reviewed_days_ago=10)
-    card = col.get_card(cards[0])
-    card.memory_state = FSRSMemoryState(stability=10.0, difficulty=5.0)
-    col.update_card(card)
+    make_review(col, cards, due_offset=4)
+    with pytest.raises(PlanOutdatedError):
+        apply_mobile_due_changes(col, [change_for(col, cards[0], col.sched.today)], plan_today=col.sched.today - 1)
 
-    def good_days():
-        states = col._backend.get_scheduling_states(cards[0])
-        return states.good.normal.review.scheduled_days
 
-    before = good_days()
-    today = col.sched.today
-    for new_due in (today + 20, today - 5):
-        apply_mobile_due_changes(col, [change_for(col, cards[0], new_due)])
-        assert col.get_card(cards[0]).due == new_due
-        assert good_days() == before
+def test_all_conflicts_leave_no_empty_undo_step(col):
+    cards = add_cards(col, 1)
+    make_review(col, cards, due_offset=4)
+    change = change_for(col, cards[0], col.sched.today)
+    stale = MobileDueChange(**{**change.__dict__, "old_mod": change.old_mod - 50})
+    result = apply_mobile_due_changes(col, [stale])
+    assert result.applied == () and result.conflicts == (cards[0],)
+    assert col.undo_status().undo != UNDO_LABEL

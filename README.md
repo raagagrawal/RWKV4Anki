@@ -146,11 +146,23 @@ cards. Mobile Due runs on the desktop after each sync and rewrites that one fiel
   lowest predicted recall first, so a phone sorting reviews by due date shows the
   most-forgotten cards first.
 
-Only `due` changes. Interval, card type, queue, learning steps and FSRS memory
-state are left alone, and learning, relearning, new, suspended, buried and
-filtered-deck cards are never touched. Each apply is one undoable step, every old
-value is written to an append-only log, and **Restore Pre-RWKV Due Dates** puts
-back the original date of every card not reviewed since Mobile Due moved it.
+Only `due` changes. If a card has no `last_review_time` yet, it is also filled
+from the revlog, as Anki itself records it, so that moving `due` can never change
+FSRS's elapsed-days input on any client. Interval, card type, queue, learning
+steps and FSRS memory state are left alone. Learning, relearning, new, suspended,
+buried and filtered-deck cards are never touched. Each apply is one undoable
+step. Every old value is written to an append-only log *before* the collection
+changes. **Restore Pre-RWKV Due Dates** puts back the scheduler's last date for
+every card not reviewed since Mobile Due moved it.
+
+**Unsynced phone answers are protected.** Anki's sync keeps whichever copy of a
+card was changed last, so rewriting a card the phone has answered but not yet
+synced would undo that answer. Automatic runs therefore never touch a card that
+is already due; they only pull cards in from the future or move future cards.
+Already-due cards stay due until answered. Automatic runs also only start after
+a sync that actually exchanged data, never after a failed one. **Apply Now** asks
+whether to also move currently-due cards. That is the full replacement, and it is
+safe once the phone has synced.
 
 ### Using it
 
@@ -162,9 +174,14 @@ back the original date of every card not reviewed since Mobile Due moved it.
 4. Phone: sync, then study the deck's Due cards as usual. Sync again afterwards
    so the desktop sees your answers before its next run.
 
-Live mode only turns on after one manual **Apply Now**. Automatic runs are held
-back, and you get a tooltip, if the due-now count jumps to more than three times
-its recent median or above half of all review cards. Logs live in the add-on's
+Live mode only turns on after one manual **Apply Now** that changed cards.
+Automatic runs are held back, with a tooltip, in any of these cases:
+
+- the due-now count is more than three times its recent median, or less than a
+  fifth of it;
+- more than half of all review cards would be due now;
+- more than half of all review cards never drop below desired retention within
+  the horizon (saturated predictions). Logs live in the add-on's
 `user_files/profiles/<profile>/mobile_due/` folder (**Open Mobile Due Log
 Folder**).
 

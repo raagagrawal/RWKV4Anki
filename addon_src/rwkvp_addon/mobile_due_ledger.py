@@ -6,9 +6,10 @@ Layout under ``<profile store>/mobile_due/``::
     changes/YYYY-MM-DD.jsonl  one line per rewritten card, by local run date
     baseline.jsonl            the first pre-RWKV ``due`` ever seen per card
 
-``baseline.jsonl`` is what "Restore pre-RWKV due dates" reads. A card is only
-added the first time Mobile Due changes it, so its value is always the
-schedule Anki/FSRS had produced before RWKV touched it.
+``baseline.jsonl`` is what "Restore pre-RWKV due dates" reads. A card is added
+the first time Mobile Due changes it, and again whenever it is moved after
+having been reviewed since, so the latest line per card is always the schedule
+the phone or desktop scheduler last produced before RWKV took it over.
 """
 
 from __future__ import annotations
@@ -62,30 +63,77 @@ class MobileDueLedger:
 
     # -- writing ---------------------------------------------------------
 
+    @staticmethod
+    def new_run_id() -> str:
+        return uuid.uuid4().hex[:12]
+
+    def record_changes(
+        self,
+        *,
+        run_id: str,
+        applied: Iterable[MobileDueChange],
+        last_review_secs: Mapping[int, int] | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Durably log rewritten cards. Call BEFORE writing them to the collection.
+
+        Raises on any I/O error so the caller can abort the apply: a change
+        must never reach the collection without a way to restore it.
+        """
+
+        applied_list = list(applied)
+        if not applied_list:
+            return
+        self.ensure()
+        timestamp = float(time.time() if now is None else now)
+        self._update_baseline(applied_list, last_review_secs or {}, timestamp)
+        day = time.strftime("%Y-%m-%d", time.localtime(timestamp))
+        _append_jsonl(
+            self.changes_dir / f"{day}.jsonl",
+            (
+                {
+                    "run_id": run_id,
+                    "timestamp": timestamp,
+                    "card_id": change.card_id,
+                    "old_due": change.old_due,
+                    "new_due": change.new_due,
+                    "old_mod": change.old_mod,
+                    "old_ivl": change.old_interval,
+                    "due_now": change.due_now,
+                    "r": round(change.predicted_retrievability, 6),
+                    "dr": change.desired_retention,
+                    "rank": change.rank,
+                }
+                for change in applied_list
+            ),
+        )
+
     def record_run(
         self,
         *,
         kind: str,
         plan: MobileDuePlan | None,
         trigger: str,
-        applied: Iterable[MobileDueChange] = (),
+        run_id: str | None = None,
+        applied_count: int = 0,
         conflicts: int = 0,
         violations: Iterable[str] = (),
         note: str = "",
         extra: Mapping[str, Any] | None = None,
         now: float | None = None,
     ) -> str:
+        """Append one run summary line."""
+
         self.ensure()
-        run_id = uuid.uuid4().hex[:12]
+        resolved_id = run_id or self.new_run_id()
         timestamp = float(time.time() if now is None else now)
-        applied_list = list(applied)
         summary: dict[str, Any] = {
-            "run_id": run_id,
+            "run_id": resolved_id,
             "timestamp": timestamp,
             "iso_time": time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(timestamp)),
             "kind": kind,
             "trigger": trigger,
-            "applied": len(applied_list),
+            "applied": int(applied_count),
             "conflicts": int(conflicts),
             "violations": list(violations),
             "note": note,
@@ -101,6 +149,7 @@ class MobileDueLedger:
                     "pulled_in": plan.pulled_in_count,
                     "pushed_out": plan.pushed_out_count,
                     "unchanged": plan.unchanged_count,
+                    "locked_due": plan.locked_due_count,
                     "capped_by_limit": plan.capped_by_limit,
                     "projected_to_horizon": plan.projected_to_horizon,
                     "expected_retrievability": plan.expected_retrievability,
@@ -109,33 +158,30 @@ class MobileDueLedger:
             )
         if extra:
             summary.update(dict(extra))
-        if applied_list:
-            self._append_baseline(applied_list, timestamp)
-            day = time.strftime("%Y-%m-%d", time.localtime(timestamp))
-            _append_jsonl(
-                self.changes_dir / f"{day}.jsonl",
-                (
-                    {
-                        "run_id": run_id,
-                        "card_id": change.card_id,
-                        "old_due": change.old_due,
-                        "new_due": change.new_due,
-                        "old_mod": change.old_mod,
-                        "old_ivl": change.old_interval,
-                        "due_now": change.due_now,
-                        "r": round(change.predicted_retrievability, 6),
-                        "dr": change.desired_retention,
-                        "rank": change.rank,
-                    }
-                    for change in applied_list
-                ),
-            )
         _append_jsonl(self.runs_path, [summary])
-        return run_id
+        return resolved_id
 
-    def _append_baseline(self, changes: Iterable[MobileDueChange], timestamp: float) -> None:
-        known = set(self.baseline())
-        fresh = [change for change in changes if change.card_id not in known]
+    def _update_baseline(
+        self,
+        changes: Iterable[MobileDueChange],
+        last_review_secs: Mapping[int, int],
+        timestamp: float,
+    ) -> None:
+        """Remember the schedule each card had before RWKV (last) took it over.
+
+        A card enters the baseline the first time Mobile Due moves it. If it is
+        reviewed afterwards, its next move records the post-review schedule
+        instead: that is the scheduler's own answer and what restore should put
+        back.
+        """
+
+        known = self.baseline()
+        fresh = []
+        for change in changes:
+            entry = known.get(change.card_id)
+            reviewed = int(last_review_secs.get(change.card_id, 0) or 0)
+            if entry is None or reviewed > entry.first_changed_at:
+                fresh.append(change)
         if not fresh:
             return
         _append_jsonl(
@@ -172,7 +218,11 @@ class MobileDueLedger:
         return counts[-int(limit):]
 
     def has_live_run(self) -> bool:
-        return any(run.get("kind") == RUN_KIND_LIVE for run in self.runs())
+        """True once a live run has actually rewritten at least one card."""
+        return any(
+            run.get("kind") == RUN_KIND_LIVE and int(run.get("applied") or 0) > 0
+            for run in self.runs()
+        )
 
     def last_run(self) -> dict[str, Any] | None:
         runs = self.runs()
@@ -190,7 +240,7 @@ class MobileDueLedger:
                 )
             except (KeyError, TypeError, ValueError):
                 continue
-            entries.setdefault(card_id, entry)
+            entries[card_id] = entry  # the latest line for a card wins
         return entries
 
 

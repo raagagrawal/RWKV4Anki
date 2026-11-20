@@ -147,54 +147,131 @@ def _set_mode(gui, mode):
     gui.mw.addonManager.config["mobile_due_mode"] = mode
 
 
-def test_sync_hook_schedules_run_only_when_enabled_and_skips_own_sync(gui):
-    _set_mode(gui, "off")
+def _bump_sync_stamp(gui):
+    gui.mw.col.db.execute("update col set ls = ls + 1000")
+
+
+def _sync(gui, *, exchanged=True):
+    gui.module._on_sync_will_start()
+    if exchanged:
+        _bump_sync_stamp(gui)
     gui.module._on_sync_did_finish()
+
+
+def test_sync_hook_runs_only_after_a_sync_that_exchanged_data(gui):
+    _set_mode(gui, "off")
+    _sync(gui)
     assert gui.mw.progress.shots == []
     _set_mode(gui, "shadow")
-    gui.module._on_sync_did_finish()
+    _sync(gui, exchanged=False)  # failed, cancelled or no-change sync
+    assert gui.mw.progress.shots == []
+    _sync(gui)
     assert len(gui.mw.progress.shots) == 1
-    gui.module._skip_next_sync_hook = True
-    gui.module._on_sync_did_finish()
+    gui.module._skip_next_sync_hook = True  # our own push
+    _sync(gui)
     assert len(gui.mw.progress.shots) == 1
     assert gui.module._skip_next_sync_hook is False
     gui.module._closing = True
-    gui.module._on_sync_did_finish()
+    _sync(gui)
     assert len(gui.mw.progress.shots) == 1
+
+
+def _decide(gui, p, *, trigger="after_sync", interactive=False):
+    gui.module._running = True
+    gui.module._decide(p, trigger=trigger, interactive=interactive, config=gui.module._config())
 
 
 def test_auto_shadow_logs_without_applying(gui, monkeypatch):
     applied = []
     monkeypatch.setattr(gui.module, "_apply", lambda *a, **k: applied.append(a))
     _set_mode(gui, "shadow")
-    gui.module._decide(plan(), trigger="after_sync", interactive=False, config=gui.module._config())
+    _decide(gui, plan())
     assert applied == []
     assert gui.ledger.runs()[-1]["kind"] == "shadow"
+    assert gui.module._running is False
 
 
-def test_auto_live_requires_a_prior_manual_apply_and_respects_guardrails(gui, monkeypatch):
+def test_auto_live_requires_manual_apply_respects_guardrails_and_locks_due_cards(gui, monkeypatch):
+    from rwkvp_addon.mobile_due import MobileDueChange
+
+    applied = []
+    monkeypatch.setattr(gui.module, "_apply", lambda p, **k: applied.append((p, k)))
+    _set_mode(gui, "live")
+    pull_in = MobileDueChange(1, 105, 100, 0, 10, True, 0.8, 0.9, 0)
+    push_out = MobileDueChange(2, 99, 120, 0, 10, False, 0.95, 0.9, None)
+    _decide(gui, plan(changes=[pull_in]))
+    assert applied == []
+    assert gui.ledger.runs()[-1]["kind"] == "aborted"
+
+    gui.ledger.record_run(kind="live", plan=plan(), trigger="menu_apply", applied_count=3)
+    for count in (10, 12, 11):
+        gui.ledger.record_run(kind="live", plan=plan(due_now=count), trigger="after_sync", applied_count=1)
+    _decide(gui, plan(due_now=400, changes=[pull_in], in_scope=2000))
+    assert applied == []
+    assert gui.ledger.runs()[-1]["kind"] == "aborted"
+    assert gui.ledger.runs()[-1]["violations"]
+
+    _decide(gui, plan(due_now=12, changes=[pull_in, push_out], in_scope=2000))
+    assert len(applied) == 1
+    sent, kwargs = applied[0]
+    assert [c.card_id for c in sent.changes] == [1]  # the already-due card is never touched
+    assert sent.locked_due_count == 1
+    assert kwargs["interactive"] is False
+
+
+def test_auto_run_abandons_when_mode_changed_while_planning(gui, monkeypatch):
     from rwkvp_addon.mobile_due import MobileDueChange
 
     applied = []
     monkeypatch.setattr(gui.module, "_apply", lambda p, **k: applied.append(p))
     _set_mode(gui, "live")
-    change = MobileDueChange(1, 105, 100, 0, 10, True, 0.8, 0.9, 0)
-    gui.module._decide(plan(changes=[change]), trigger="after_sync", interactive=False, config=gui.module._config())
+    gui.ledger.record_run(kind="live", plan=plan(), trigger="menu_apply", applied_count=3)
+    started = gui.module._config()
+    _set_mode(gui, "off")  # e.g. Restore switched it off mid-run
+    gui.module._running = True
+    gui.module._decide(
+        plan(changes=[MobileDueChange(1, 105, 100, 0, 10, True, 0.8, 0.9, 0)]),
+        trigger="after_sync",
+        interactive=False,
+        config=started,
+    )
     assert applied == []
-    assert gui.ledger.runs()[-1]["kind"] == "aborted"
+    assert gui.module._running is False
 
-    gui.ledger.record_run(kind="live", plan=plan(), trigger="menu_apply")
-    for count in (10, 12, 11):
-        gui.ledger.record_run(kind="live", plan=plan(due_now=count), trigger="after_sync")
-    spike = plan(due_now=400, changes=[change], in_scope=2000)
-    gui.module._decide(spike, trigger="after_sync", interactive=False, config=gui.module._config())
-    assert applied == []
-    assert gui.ledger.runs()[-1]["kind"] == "aborted"
-    assert gui.ledger.runs()[-1]["violations"]
 
-    normal = plan(due_now=12, changes=[change], in_scope=2000)
-    gui.module._decide(normal, trigger="after_sync", interactive=False, config=gui.module._config())
-    assert applied == [normal]
+def test_interactive_apply_lets_user_choose_to_move_due_cards(gui, monkeypatch):
+    from rwkvp_addon.mobile_due import MobileDueChange
+
+    applied, prompts = [], []
+
+    def fake_confirm(**kwargs):
+        prompts.append(kwargs)
+
+    monkeypatch.setattr(gui.module, "ask_web_confirmation", fake_confirm)
+    monkeypatch.setattr(gui.module, "_apply", lambda p, **k: applied.append(p))
+    changes = [MobileDueChange(1, 105, 100, 0, 10, True, 0.8, 0.9, 0), MobileDueChange(2, 99, 120, 0, 10, False, 0.95, 0.9, None)]
+    _decide(gui, plan(changes=changes), trigger="menu_apply", interactive=True)
+    prompt = prompts[-1]
+    assert prompt["checkbox_checked"] is True  # first run: full replacement offered by default
+    prompt["on_checkbox_changed"](False)
+    prompt["on_result"](True)
+    assert [c.card_id for c in applied[-1].changes] == [1]
+    _decide(gui, plan(changes=changes), trigger="menu_apply", interactive=True)
+    prompts[-1]["on_result"](True)
+    assert [c.card_id for c in applied[-1].changes] == [1, 2]
+    _decide(gui, plan(changes=changes), trigger="menu_apply", interactive=True)
+    prompts[-1]["on_result"](False)
+    assert gui.module._running is False
+
+
+def test_settings_and_restore_refused_while_running(gui, monkeypatch):
+    shown = []
+    monkeypatch.setattr(gui.module, "ask_web_confirmation", lambda **k: shown.append(k))
+    gui.module._running = True
+    gui.module._confirm_restore()
+    gui.module._show_settings()
+    assert shown == []
+    assert any("running" in tip for tip in gui.mw.tips)
 
 
 def test_push_sync_flags_own_sync(gui):

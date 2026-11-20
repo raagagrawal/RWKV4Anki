@@ -9,6 +9,9 @@ from rwkvp_addon.anki_api import DeckRetention
 from rwkvp_addon.curve_reschedule import CardScheduleInfo
 from rwkvp_addon.mobile_due import (
     GuardrailSettings,
+    MobileDueChange,
+    MobileDuePlan,
+    lock_currently_due,
     MobileDueSettings,
     MobileDueSkipReason,
     build_mobile_due_plan,
@@ -65,7 +68,8 @@ def make_world(cards: dict[int, dict]):
         if spec.get("history", True):
             last_by_card[cid] = LastReviewInfo(
                 review_id=int(last_ts * 1000),
-                day_offset=spec["last_day"] - TODAY,
+                # Today is raw day offset -1 relative to next_day_at (see review_rows).
+                day_offset=spec["last_day"] - TODAY - 1,
                 timestamp_seconds=last_ts,
                 interval=spec.get("ivl", 10),
                 lapse_count=0,
@@ -274,3 +278,63 @@ def test_settings_validation():
         MobileDueSettings(priority_buckets=0)
     with pytest.raises(ValueError):
         MobileDueSettings(limit=-1)
+
+
+def test_minimum_widening_never_sends_above_dr_cards_to_tomorrow():
+    """Regression: widened-but-unselected cards must be projected, not capped."""
+    cards = {1: {"last_day": TODAY - 40, "stability": 5.0, "due": TODAY},
+             2: {"last_day": TODAY - 35, "stability": 5.0, "due": TODAY}}
+    for cid in range(3, 33):  # just above DR at T
+        cards[cid] = {"last_day": TODAY - 1, "stability": 8.0 + cid * 0.1, "due": TODAY + 3}
+    target = DAY_CUTOFF - 60
+    plan, fake, review_data = plan_for(
+        cards, settings=MobileDueSettings(minimum=5, priority_buckets=1), target=target
+    )
+    assert plan.due_now_count == 5  # 2 below DR + 3 widened picks
+    assert plan.capped_by_limit == 0
+    by_card = {c.card_id: c.new_due for c in plan.changes}
+    for cid in cards:
+        if cid in plan.due_now_ids:
+            continue
+        last_ts = review_data.last_by_card[cid].timestamp_seconds
+        expected = TODAY + expected_crossing_offset(fake, cid, last_ts, target, 365)
+        assert by_card.get(cid, cards[cid]["due"]) == expected
+
+
+def test_no_crossing_within_horizon_never_pulls_a_card_earlier():
+    cards = {1: {"last_day": TODAY - 1, "stability": 10_000.0, "due": TODAY + 200}}
+    plan, _f, _ = plan_for(cards, settings=MobileDueSettings(priority_buckets=1, horizon_days=30))
+    assert plan.changes == ()  # stays at +200 rather than moving to +30
+    # ...but the deck's max interval still wins over a later current schedule.
+    plan, _f, _ = plan_for(cards, max_interval=50, settings=MobileDueSettings(priority_buckets=1, horizon_days=30))
+    assert plan.changes[0].new_due == TODAY - 1 + 50
+
+
+def test_lock_currently_due_drops_every_change_to_due_cards():
+    def change(cid, old, new):
+        return MobileDueChange(cid, old, new, 0, 10, new <= TODAY, 0.8, 0.9)
+
+    plan = MobileDuePlan(
+        created_at=0, target_timestamp=0, today=TODAY, in_scope_count=4,
+        due_now_ids=(1, 2), unchanged_count=0,
+        changes=(
+            change(1, TODAY, TODAY - 3),   # already due, re-bucketed: locked
+            change(2, TODAY + 4, TODAY),   # pulled in from the future: allowed
+            change(3, TODAY - 1, TODAY + 6),  # due, pushed out: locked
+            change(4, TODAY + 9, TODAY + 2),  # future to future: allowed
+        ),
+    )
+    locked = lock_currently_due(plan)
+    assert [c.card_id for c in locked.changes] == [2, 4]
+    assert locked.locked_due_count == 2
+    assert locked.pushed_out_count == 0
+    assert all(c.old_due > TODAY for c in locked.changes)
+
+
+def test_guardrails_catch_collapse_and_saturation():
+    cards = {cid: {"last_day": TODAY - 1, "stability": 10_000.0, "due": TODAY} for cid in range(1, 151)}
+    plan, _f, _ = plan_for(cards)
+    assert plan.due_now_count == 0
+    violations = guardrail_violations(plan, recent_due_now_counts=[60, 70, 80])
+    assert any("far below the recent median" in v for v in violations)
+    assert any("never drop below" in v for v in violations)

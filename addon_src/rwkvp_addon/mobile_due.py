@@ -121,6 +121,7 @@ class MobileDuePlan:
     expected_retrievability: float | None = None
     capped_by_limit: int = 0
     projected_to_horizon: int = 0
+    locked_due_count: int = 0
 
     @property
     def due_now_count(self) -> int:
@@ -299,15 +300,21 @@ def build_mobile_due_plan(
         random_card_percent=settings.random_card_percent,
     )
     if candidates:
-        below, selected, _extra = select_candidates_with_minimum(
+        _eligible, selected, _extra = select_candidates_with_minimum(
             candidates,
             settings=selection_settings,
         )
     else:
-        below, selected = [], []
+        selected = []
     selected_ids = [candidate.card_id for candidate in selected]
     selected_set = set(selected_ids)
-    below_set = {candidate.card_id for candidate in below}
+    # Below plain desired retention (never the minimum-widened threshold): only
+    # these are known to be due already and so cannot be projected forward.
+    below_set = {
+        candidate.card_id
+        for candidate in candidates
+        if candidate.predicted_retrievability < candidate.active_desired_retention
+    }
 
     new_due: dict[int, int] = {}
     rank_by_card: dict[int, int] = {}
@@ -318,7 +325,7 @@ def build_mobile_due_plan(
         new_due[card_id] = int(today) - (buckets - 1 - bucket)
         rank_by_card[card_id] = rank
 
-    # Below desired retention but cut by the limit: earliest possible later day.
+    # Below desired retention but cut by the card limit: earliest later day.
     capped = [c for c in candidates if c.card_id in below_set and c.card_id not in selected_set]
     for candidate in capped:
         new_due[candidate.card_id] = int(today) + 1
@@ -478,12 +485,41 @@ def _project_crossing_days(
     at_horizon = 0
     for card_id in lo:
         if card_id in hi:
-            offset = hi[card_id]
-        else:
-            offset = cap[card_id]
-            at_horizon += 1
-        result[card_id] = int(today) + max(1, int(offset))
+            result[card_id] = int(today) + max(1, int(hi[card_id]))
+            continue
+        at_horizon += 1
+        cap_day = int(today) + max(1, int(cap[card_id]))
+        # No crossing within the horizon: never pull the card earlier than its
+        # current schedule, unless that schedule exceeds the deck's max interval.
+        current_due = int(schedule_by_card[card_id].due)
+        limit_day = _max_interval_day(
+            schedule_by_card[card_id],
+            review_data=review_data,
+            max_interval_by_deck=max_interval_by_deck,
+            today=today,
+            day_cutoff=day_cutoff,
+        )
+        keep = current_due if limit_day is None else min(current_due, limit_day)
+        result[card_id] = max(cap_day, keep)
     return result, at_horizon
+
+
+def _max_interval_day(
+    schedule: CardScheduleInfo,
+    *,
+    review_data: ReviewData,
+    max_interval_by_deck: Mapping[int, int | None],
+    today: int,
+    day_cutoff: int,
+) -> int | None:
+    max_interval = max_interval_by_deck.get(int(schedule.source_deck_id or 0))
+    last_review = review_data.last_by_card.get(int(schedule.card_id))
+    if max_interval is None or last_review is None:
+        return None
+    last_day = anki_day_for_timestamp(
+        last_review.timestamp_seconds, today=today, day_cutoff=day_cutoff
+    )
+    return int(last_day) + int(max_interval)
 
 
 def _offset_cap(
@@ -540,6 +576,9 @@ class GuardrailSettings:
     spike_minimum_cards: int = 50
     max_due_now_fraction: float = 0.5
     max_due_now_fraction_min_scope: int = 100
+    collapse_divisor: float = 5.0
+    collapse_minimum_median: int = 20
+    max_horizon_fraction: float = 0.5
     history_runs: int = 7
 
 
@@ -561,6 +600,21 @@ def guardrail_violations(
             violations.append(
                 f"{plan.due_now_count} cards due now is more than "
                 f"{resolved.spike_multiplier:g}x the recent median ({baseline})."
+            )
+        if (
+            baseline >= int(resolved.collapse_minimum_median)
+            and plan.due_now_count < baseline / float(resolved.collapse_divisor)
+        ):
+            violations.append(
+                f"Only {plan.due_now_count} cards due now, far below the recent median "
+                f"({baseline}); predictions may be broken."
+            )
+    if plan.in_scope_count >= int(resolved.max_due_now_fraction_min_scope):
+        horizon_fraction = plan.projected_to_horizon / max(1, plan.in_scope_count)
+        if horizon_fraction > float(resolved.max_horizon_fraction):
+            violations.append(
+                f"{horizon_fraction:.0%} of review cards never drop below desired "
+                "retention within the horizon; predictions may be saturated."
             )
     if plan.in_scope_count >= int(resolved.max_due_now_fraction_min_scope):
         fraction = plan.due_now_count / max(1, plan.in_scope_count)
@@ -586,6 +640,11 @@ def plan_summary_lines(plan: MobileDuePlan) -> list[str]:
         lines.append(f"Below desired retention but over the card limit: {plan.capped_by_limit}")
     if plan.projected_to_horizon:
         lines.append(f"Projected to the horizon / max interval: {plan.projected_to_horizon}")
+    if plan.locked_due_count:
+        lines.append(
+            f"Already due, left as they are (may have unsynced phone answers): "
+            f"{plan.locked_due_count}"
+        )
     if plan.skipped:
         skipped = ", ".join(
             f"{reason.value.replace('_', ' ')} {count}"
@@ -597,3 +656,19 @@ def plan_summary_lines(plan: MobileDuePlan) -> list[str]:
 
 def plan_with_changes(plan: MobileDuePlan, changes: Iterable[MobileDueChange]) -> MobileDuePlan:
     return replace(plan, changes=tuple(changes))
+
+
+def lock_currently_due(plan: MobileDuePlan) -> MobileDuePlan:
+    """Drop every change to a card that is already due (``old_due <= today``).
+
+    A card that is due may have been answered on the phone without that answer
+    having reached the desktop yet. Anki's sync keeps whichever copy of a card
+    row was modified last, so rewriting such a card on the desktop would undo
+    the phone's answer. Cards that are not due cannot have been studied on the
+    phone, so pulling them in or moving them later is safe. Locked cards stay
+    due until they are answered; their due-now status is reported separately.
+    """
+
+    kept = [change for change in plan.changes if int(change.old_due) > int(plan.today)]
+    locked = len(plan.changes) - len(kept)
+    return replace(plan, changes=tuple(kept), locked_due_count=plan.locked_due_count + locked)

@@ -101,10 +101,18 @@ def mobile_due_config(
         prediction_time=prediction_time,
         run_after_sync=_bool(source.get(RUN_AFTER_SYNC_KEY), True),
         sync_after_apply=_bool(source.get(SYNC_AFTER_APPLY_KEY), True),
-        auto_sync_hours=_float(source.get(AUTO_SYNC_HOURS_KEY), 0.0, 0.0, 24.0),
+        auto_sync_hours=_auto_sync_hours(source.get(AUTO_SYNC_HOURS_KEY)),
         settings=settings,
         guardrails_enabled=_bool(source.get(GUARDRAILS_KEY), True),
     )
+
+
+MIN_AUTO_SYNC_HOURS = 0.25
+
+
+def _auto_sync_hours(value: object) -> float:
+    hours = _float(value, 0.0, 0.0, 24.0)
+    return 0.0 if hours <= 0 else max(MIN_AUTO_SYNC_HOURS, hours)
 
 
 def with_mode(config: Mapping[str, Any], mode: MobileDueMode) -> dict[str, Any]:
