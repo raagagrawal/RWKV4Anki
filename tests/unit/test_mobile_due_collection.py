@@ -45,9 +45,14 @@ def add_cards(col, count, deck_name="Default"):
     return ids
 
 
-def make_review(col, card_ids, *, due_offset=0, ivl=10):
+def make_review(col, card_ids, *, due_offset=0, ivl=10, reviewed_days_ago=10):
     today = col.sched.today
-    for card_id in card_ids:
+    for index, card_id in enumerate(card_ids):
+        review_ms = int((time.time() - reviewed_days_ago * 86400) * 1000) + index
+        col.db.execute(
+            "insert into revlog (id,cid,usn,ease,ivl,lastIvl,factor,time,type) values (?,?,?,?,?,?,?,?,?)",
+            review_ms, card_id, -1, 3, ivl, 0, 0, 4000, 1,
+        )
         col.db.execute(
             "update cards set type=2, queue=2, ivl=?, due=?, mod=?, usn=-1 where id=?",
             ivl,
@@ -128,6 +133,9 @@ def test_apply_writes_only_due_as_one_undo_step(col):
             before[cid].type, before[cid].queue, before[cid].ivl, before[cid].left, before[cid].odid,
         )
         assert card.usn == -1  # will be sent on next sync
+        # FSRS's elapsed-days input is pinned to the real last review.
+        last_ms = col.db.scalar("select max(id) from revlog where cid=?", cid)
+        assert card.last_review_time == last_ms // 1000
     # Due-now cards are what the scheduler would show as due today.
     due_today = set(col.find_cards("is:due"))
     assert {cards[0], cards[1]} <= due_today
@@ -202,3 +210,35 @@ def test_ledger_roundtrip(tmp_path):
     archived = ledger.archive_baseline(now=3000.0)
     assert archived is not None and archived.exists()
     assert ledger.baseline() == {}
+
+
+def test_apply_refuses_cards_without_a_graded_review(col):
+    cards = add_cards(col, 1)
+    today = col.sched.today
+    col.db.execute("update cards set type=2, queue=2, ivl=5, due=? where id=?", today + 2, cards[0])
+    result = apply_mobile_due_changes(col, [change_for(col, cards[0], today)])
+    assert result.applied == ()
+    assert result.conflicts == (cards[0],)
+    assert col.get_card(cards[0]).due == today + 2
+
+
+def test_moving_due_does_not_change_fsrs_next_interval(col):
+    from anki.cards import FSRSMemoryState
+
+    col.set_config("fsrs", True)
+    cards = add_cards(col, 1)
+    make_review(col, cards, due_offset=0, ivl=10, reviewed_days_ago=10)
+    card = col.get_card(cards[0])
+    card.memory_state = FSRSMemoryState(stability=10.0, difficulty=5.0)
+    col.update_card(card)
+
+    def good_days():
+        states = col._backend.get_scheduling_states(cards[0])
+        return states.good.normal.review.scheduled_days
+
+    before = good_days()
+    today = col.sched.today
+    for new_due in (today + 20, today - 5):
+        apply_mobile_due_changes(col, [change_for(col, cards[0], new_due)])
+        assert col.get_card(cards[0]).due == new_due
+        assert good_days() == before

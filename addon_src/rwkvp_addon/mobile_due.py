@@ -440,7 +440,9 @@ def _project_crossing_days(
         for card_id, value in zip(ids, values, strict=True):
             offset = probes[card_id]
             prediction = float(value)
-            if math.isfinite(prediction) and prediction < threshold[card_id]:
+            # A missing prediction counts as "below": the card comes back early
+            # rather than being pushed out to the horizon.
+            if not math.isfinite(prediction) or prediction < threshold[card_id]:
                 hi[card_id] = offset
             else:
                 lo[card_id] = offset

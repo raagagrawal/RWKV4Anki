@@ -105,6 +105,9 @@ def apply_mobile_due_changes(col, changes: Sequence[MobileDueChange]) -> ApplyRe
     conflicts: list[int] = []
     for start in range(0, len(changes), APPLY_CHUNK_SIZE):
         chunk = changes[start : start + APPLY_CHUNK_SIZE]
+        last_review_secs = _latest_graded_review_secs_by_card(
+            col, (change.card_id for change in chunk)
+        )
         cards = []
         for change in chunk:
             try:
@@ -115,6 +118,9 @@ def apply_mobile_due_changes(col, changes: Sequence[MobileDueChange]) -> ApplyRe
             if not _still_as_planned(card, change):
                 conflicts.append(change.card_id)
                 continue
+            if not _pin_last_review_time(card, last_review_secs.get(change.card_id)):
+                conflicts.append(change.card_id)
+                continue
             card.due = int(change.new_due)
             cards.append(card)
             applied.append(change)
@@ -122,6 +128,39 @@ def apply_mobile_due_changes(col, changes: Sequence[MobileDueChange]) -> ApplyRe
             col.update_cards(cards)
     op_changes = col.merge_undo_entries(undo_target)
     return ApplyResult(applied=tuple(applied), conflicts=tuple(conflicts), changes=op_changes)
+
+
+def _pin_last_review_time(card, revlog_secs: int | None) -> bool:
+    """Make sure moving ``due`` cannot change FSRS's elapsed-days input.
+
+    When ``last_review_time`` is unset, Anki derives the last review day from
+    ``due - ivl``, so moving ``due`` would corrupt the elapsed time FSRS uses
+    when the card is next answered (on any device). Fill it from the revlog,
+    exactly as Anki itself records it on every review. Returns False when it
+    cannot be established, in which case the card must not be moved.
+    """
+
+    if not hasattr(card, "last_review_time"):
+        return False
+    current = getattr(card, "last_review_time", None)
+    if current:
+        return True
+    if not revlog_secs:
+        return False
+    card.last_review_time = int(revlog_secs)
+    return True
+
+
+def _latest_graded_review_secs_by_card(col, card_ids: Iterable[int]) -> dict[int, int]:
+    ids = sorted({int(card_id) for card_id in card_ids})
+    if not ids:
+        return {}
+    rows = col.db.all(
+        "SELECT cid, MAX(id) FROM revlog "
+        f"WHERE cid IN ({','.join(map(str, ids))}) AND ease BETWEEN 1 AND 4 "
+        "GROUP BY cid"
+    )
+    return {int(cid): int(review_id) // 1000 for cid, review_id in rows if review_id}
 
 
 def _still_as_planned(card, change: MobileDueChange) -> bool:
